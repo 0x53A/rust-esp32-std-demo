@@ -2,6 +2,8 @@
 #![allow(clippy::single_component_path_imports)]
 //#![feature(backtrace)]
 
+#![feature(try_blocks)]
+
 #[cfg(all(feature = "qemu", not(esp32)))]
 compile_error!("The `qemu` feature can only be built for the `xtensa-esp32-espidf` target.");
 
@@ -26,12 +28,11 @@ use core::cell::RefCell;
 use core::ffi;
 use core::sync::atomic::*;
 
-use std::{fs, mem};
+use std::{fs, mem, result};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::PathBuf;
-use std::sync::{Condvar, Mutex};
 use std::{env, sync::Arc, thread, time::*};
 
 use anyhow::{bail, Result};
@@ -73,7 +74,14 @@ use sensor_scd30::Scd30;
 use ssd1306;
 use ssd1306::mode::DisplayConfig;
 
+
+use byteorder::{ByteOrder, LittleEndian};
+
 use epd_waveshare::{epd4in2::*, graphics::VarDisplay, prelude::*};
+
+use esp32_nimble::{uuid128, BLEDevice, NimbleProperties};
+//use esp_idf_sys as _;
+use std::format;
 
 #[allow(dead_code)]
 #[cfg(not(feature = "qemu"))]
@@ -87,6 +95,12 @@ include!(env!("EMBUILD_GENERATED_SYMBOLS_FILE"));
 
 
 type MyDisplay = ssd1306::Ssd1306<ssd1306::prelude::I2CInterface<i2c::I2cDriver<'static>>, ssd1306::prelude::DisplaySize128x64, ssd1306::mode::BufferedGraphicsMode<ssd1306::prelude::DisplaySize128x64>>;
+
+//type Mutex<T> = embedded_svc::utils::mutex::Mutex<embedded_svc::utils::mutex::RawMutex, T>;
+
+struct SendWrapper<T>(T);
+//unsafe impl<T> Send for SendWrapper<T>  {}
+//unsafe impl<T> Sync for SendWrapper<T>  {}
 
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -116,45 +130,161 @@ fn main() -> Result<()> {
                 .sda_enable_pullup(true)
     )?;
 
-    let mut scd30 = Scd30::new(i2c_scd30, Delay::new(0))
+    let mut scd30: Scd30<i2c::I2cDriver<'_>, Delay, i2c::I2cError> = Scd30::new(i2c_scd30, Delay::new(0))
         .map_err(|e| anyhow::anyhow!("SCD30 error: {:?}", e))?;
-
+    
 
     setStatus(&mut display, "Reading SCD30 ...")?;
 
+    esp_idf_hal::delay::FreeRtos::delay_ms(1000 as u32);
 
-    let firmwareVersion = scd30.firmware_version()
+    scd30.soft_reset()
         .map_err(|e| anyhow::anyhow!("SCD30 error: {:?}", e))?;
 
-    setStatus(&mut display, format!("FV: {firmwareVersion}").as_str())?;
+    esp_idf_hal::delay::FreeRtos::delay_ms(1000 as u32);
 
-    delay::Ets::delay_ms(1000 as u32);
+    let firmware_version = scd30.firmware_version()
+        .map_err(|e| anyhow::anyhow!("SCD30 error: {:?}", e))?;
+
+    scd30.set_alt_offset(600);
+    scd30.set_afc(false);
+    scd30.set_measurement_interval(2);
+    scd30.set_temp_offset(0.0);
+
+    setStatus(&mut display, format!("FV: {firmware_version}").as_str())?;
+
+    esp_idf_hal::delay::FreeRtos::delay_ms(1000 as u32);
 
     scd30.start_continuous(0)
         .map_err(|e| anyhow::anyhow!("SCD30 error: {:?}", e))?;
 
+    esp_idf_hal::delay::FreeRtos::delay_ms(1000 as u32);
+
+    // read once
+    let mut measurement = scd30.read_data()
+        .map_err(|e| anyhow::anyhow!("SCD30 error: {:?}", e))?;
+
+
+    // put it into an Arc
+    let scd30 = Arc::new(std::sync::Mutex::new(SendWrapper(scd30)));
+
+    // ------------------
+
+
+    let ble_device = BLEDevice::take();
+
+    let server = ble_device.get_server();
+
+
+    let ble_advertising = ble_device.get_advertising();
+
+    server.on_connect(|server, desc| {
+      ::log::info!("Client connected");
+  
+      server
+        .update_conn_params(desc.conn_handle, 24, 48, 0, 60)
+        .unwrap();
+  
+      //::log::info!("Multi-connect support: start advertising");
+      //ble_device.get_advertising().start().unwrap();
+    });
+    server.on_disconnect(|_desc, reason| {
+      ::log::info!("Client disconnected ({:X})", reason);
+    });
+    let service = server.create_service(uuid128!("fafafafa-fafa-fafa-fafa-fafafafafafa"));
+  
+    // CO2
+    let co2_characteristic = service.lock().create_characteristic(
+      uuid128!("d4e0e0d0-1a2b-11e9-ab14-d663bd873d93"),
+      NimbleProperties::READ | NimbleProperties::NOTIFY,
+    );
+    co2_characteristic
+      .lock()
+      .set_value(&measurement.co2.to_le_bytes());
+  
+    // Temperature
+    let temp_characteristic = service.lock().create_characteristic(
+      uuid128!("a3c87500-8ed3-4bdf-8a39-a01bebede295"),
+      NimbleProperties::READ | NimbleProperties::NOTIFY,
+    );
+    temp_characteristic
+      .lock()
+      .set_value(&measurement.temp.to_le_bytes());
+  
+    // Forced Recalibration
+    let calibrate_characteristic = service.lock().create_characteristic(
+      uuid128!("3c9a3f00-8ed3-4bdf-8a39-a01bebede295"),
+      NimbleProperties::WRITE,
+    );
+
+    let copyOfScd30 = Arc::clone(&scd30);
+
+    calibrate_characteristic
+      .lock()
+      .on_write(move |args| {
+        let recalibration_value = LittleEndian::read_u16(args.recv_data);
+        ::log::info!("Recalibrating to: {:?}ppm", recalibration_value);
+        copyOfScd30.lock().unwrap().0.set_frc(recalibration_value).unwrap();
+
+        //setStatus(&mut display, format!("Calibrated: {recalibrationValue}").as_str());
+      });
+  
+    ble_advertising
+      .name("ESP32-CO2-Sensor")
+      .add_service_uuid(uuid128!("fafafafa-fafa-fafa-fafa-fafafafafafa"));
+  
+    ble_advertising.start().unwrap();
+
+        // -------
+    
+    let mut counter = 0;
 
     loop {
-            
-        let measurement = scd30.read_data()
-            .map_err(|e| anyhow::anyhow!("SCD30 error: {:?}", e))?;
+        let result: Result<()> = try {
 
-        let co2 = measurement.co2;
-        let rh = measurement.rh;
-        let temp = measurement.temp;
+            measurement = scd30.lock().map(|mut x| x.0.read_data())//.0.read_data()
+              .map_err(|e| anyhow::anyhow!("SCD30 error: {:?}", e))?
+              .map_err(|e| anyhow::anyhow!("SCD30 error: {:?}", e))?;
 
-        setStatus(&mut display, format!("co2: {co2}").as_str())?;
+            let co2 = measurement.co2;
+            let rh = measurement.rh;
+            let temp = measurement.temp;
 
-        delay::Ets::delay_ms(1000 as u32);
+            // update bluetooth
+            co2_characteristic
+                .lock()
+                .set_value(&co2.to_le_bytes())
+                .notify();
 
-        setStatus(&mut display, format!("rh: {rh}").as_str())?;
+            temp_characteristic
+              .lock()
+              .set_value(&temp.to_le_bytes());
 
-        delay::Ets::delay_ms(1000 as u32);
+            // update oled
 
-        setStatus(&mut display, format!("temp: {temp}").as_str())?;
+            setStatus(&mut display, format!("rh: {rh}").as_str())?;
 
-        delay::Ets::delay_ms(1000 as u32);
+            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+
+            setStatus(&mut display, format!("temp: {temp}").as_str())?;
+
+            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+
+            setStatus(&mut display, format!("co2: {co2}").as_str())?;
+
+            esp_idf_hal::delay::FreeRtos::delay_ms(2000);
+        };
+
+        if let Err(e) = result {
+
+            setStatus(&mut display, format!("ERR: {e}").as_str())?;
+
+            delay::Ets::delay_ms(10000 as u32);
+        }
     }
+
+  
+
     // let mut outputDriver = gpio::PinDriver::output(pins.gpio35)?;
     // while (true) {
     //     outputDriver.set_low();
@@ -205,34 +335,6 @@ fn init_display(
     display
         .init()
         .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
-
-
-    // display.clear();
-
-    // Rectangle::new(display.bounding_box().top_left, display.bounding_box().size)
-    //     .into_styled(
-    //         PrimitiveStyleBuilder::new()
-    //             .fill_color(BinaryColor::Off)
-    //             .stroke_color(BinaryColor::On)
-    //             .stroke_width(1)
-    //             .build(),
-    //     )
-    //     .draw(&mut display)
-    //     .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
-
-    // Text::new(
-    //     "Hello Rust!",
-    //     Point::new(10, (display.bounding_box().size.height - 10) as i32 / 2),
-    //     MonoTextStyle::new(&FONT_10X20, BinaryColor::On),
-    // )
-    // .draw(&mut display)
-    // .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
-
-    // info!("LED rendering done");
-
-    // display
-    //     .flush()
-    //     .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
     
     writeText(&mut display, "Hello Rust!",BinaryColor::Off, BinaryColor::On, BinaryColor::Off, BinaryColor::On)
         .map_err(|e| anyhow::anyhow!("Display error: {:?}", e))?;
