@@ -38,6 +38,7 @@ use std::{env, sync::Arc, thread, time::*};
 use anyhow::{bail, Result};
 
 use async_io::{Async, Timer};
+use esp_idf_hal::ledc::Resolution;
 use esp_idf_svc::http::server::{EspHttpConnection, Request};
 use esp_idf_svc::io::Write;
 use log::*;
@@ -82,6 +83,8 @@ use epd_waveshare::{epd4in2::*, graphics::VarDisplay, prelude::*};
 use esp32_nimble::{uuid128, BLEDevice, NimbleProperties};
 //use esp_idf_sys as _;
 use std::format;
+
+use esp_idf_hal::ledc::{config::TimerConfig, LedcDriver, LedcTimerDriver};
 
 #[allow(dead_code)]
 #[cfg(not(feature = "qemu"))]
@@ -170,6 +173,18 @@ fn main() -> Result<()> {
 
     // ------------------
 
+    
+    let timer_driver = LedcTimerDriver::new(peripherals.ledc.timer1, &TimerConfig::default().frequency(50.Hz().into()).resolution(Resolution::Bits13))?;
+
+    let mut driver = LedcDriver::new(peripherals.ledc.channel1, timer_driver, pins.gpio44)?;
+
+    let max_duty = driver.get_max_duty();
+    ::log::info!("PWM: max_duty = ({:?})", max_duty);
+    let minValue = max_duty / 20;
+    let maxValue = max_duty / 10;
+    driver.set_duty((minValue + maxValue) / 2)?;
+
+    // --------------------
 
     let ble_device = BLEDevice::take();
 
@@ -228,6 +243,40 @@ fn main() -> Result<()> {
 
         //setStatus(&mut display, format!("Calibrated: {recalibrationValue}").as_str());
       });
+
+
+      // -----------
+
+    // 
+        let motor_characteristic = service.lock().create_characteristic(
+        uuid128!("be143eeb-6599-4385-8422-610fff794c4f"),
+        NimbleProperties::WRITE,
+    );
+
+      motor_characteristic
+      .lock()
+      .on_write(move |args| {
+        if args.recv_data.len() != 1 {
+
+            ::log::error!("Invalid data length: {:?}%", args.recv_data.len());
+            return;
+        }
+
+        if args.recv_data[0] == 0xff {
+            ::log::warn!("set pwm duty cycle to 100%");
+            driver.set_duty(max_duty);
+            return;
+        }
+
+        let motorDriverPwmPercent = args.recv_data[0] as u32;
+        let delta = maxValue - minValue;
+        let target_duty = minValue + (delta * motorDriverPwmPercent / 100);
+        ::log::info!("Setting motor PWM to: {:?}% ({:?} / {:?} = {:?}% duty cycle)", motorDriverPwmPercent, target_duty, max_duty, target_duty * 100 / max_duty);
+        driver.set_duty(target_duty);
+        //setStatus(&mut display, format!("Calibrated: {recalibrationValue}").as_str());
+      });
+
+      // ------------
   
     ble_advertising
       .name("ESP32-CO2-Sensor")
@@ -282,8 +331,6 @@ fn main() -> Result<()> {
             delay::Ets::delay_ms(10000 as u32);
         }
     }
-
-  
 
     // let mut outputDriver = gpio::PinDriver::output(pins.gpio35)?;
     // while (true) {
