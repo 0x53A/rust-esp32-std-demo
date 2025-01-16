@@ -75,6 +75,9 @@ esp-idf-hal = "0.42.5"
 byteorder = "1.5.0"
 embedded-svc = "0.26.4"
 embassy-executor = "0.4.0"
+ring = "0.17.8"
+async-std = "1.12.0"
+mailboxxy-rs = { git = "https://github.com/0x53A/mailboxxy-rs.git" }
 
 [build-dependencies]
 embuild = { version = "0.31.3", features = ["elf"] }

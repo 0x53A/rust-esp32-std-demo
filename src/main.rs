@@ -4,6 +4,8 @@
 
 #![feature(try_blocks)]
 
+mod ota;
+
 #[cfg(all(feature = "qemu", not(esp32)))]
 compile_error!("The `qemu` feature can only be built for the `xtensa-esp32-espidf` target.");
 
